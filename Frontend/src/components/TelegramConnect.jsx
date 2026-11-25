@@ -12,16 +12,24 @@ export default function TelegramConnect({ onClose }) {
   const [busy, setBusy] = useState(false);
 
   useEffect(() => {
-    supabase.auth.getUser().then(async ({ data }) => {
-      if (!data?.user) return;
+    supabase.auth.getUser().then(async ({ data, error }) => {
+      if (error || !data?.user) {
+        setErrorMsg('User login session nathi mali. Ek var Logout kari fari login karo.');
+        return;
+      }
       const uid = data.user.id;
       setUserId(uid);
 
-      const { data: row } = await supabase
+      const { data: row, error: fetchErr } = await supabase
         .from('user_telegram_sessions')
         .select('*')
         .eq('user_id', uid)
         .maybeSingle();
+
+      if (fetchErr) {
+        setErrorMsg('Table Error: ' + fetchErr.message);
+        return;
+      }
 
       if (row) {
         if (row.phone_number) setPhone(row.phone_number);
@@ -54,18 +62,46 @@ export default function TelegramConnect({ onClose }) {
 
   const handleSendOtp = async (e) => {
     e.preventDefault();
-    if (!userId || phone.trim().length < 10) return;
+    if (!userId) {
+      setErrorMsg('User ID missing. Page refresh karo.');
+      return;
+    }
+    if (phone.trim().length < 10) {
+      setErrorMsg('Sacho mobile number nakho (+91 sathe).');
+      return;
+    }
+
     setBusy(true);
     setErrorMsg('');
-    await supabase.from('user_telegram_sessions').upsert({
-      user_id: userId,
-      phone_number: phone.trim(),
-      status: 'SEND_OTP',
-      otp_code: null,
-      two_fa_password: null,
-      error_msg: null,
-    });
+
+    const { error } = await supabase.from('user_telegram_sessions').upsert(
+      {
+        user_id: userId,
+        phone_number: phone.trim(),
+        status: 'SEND_OTP',
+        otp_code: null,
+        two_fa_password: null,
+        error_msg: null,
+      },
+      { onConflict: 'user_id' }
+    );
+
+    if (error) {
+      setBusy(false);
+      setErrorMsg('Supabase Save Error: ' + error.message);
+      return;
+    }
+
     setStatus('SEND_OTP');
+
+    setTimeout(() => {
+      setBusy((prev) => {
+        if (prev) {
+          setErrorMsg('Render server response nathi aapyo. Render Dashboard ma Logs check karo.');
+        }
+        return false;
+      });
+    }, 15000);
   };
 
   const handleVerifyOtp = async (e) => {
@@ -73,10 +109,17 @@ export default function TelegramConnect({ onClose }) {
     if (!userId || !otp.trim()) return;
     setBusy(true);
     setErrorMsg('');
-    await supabase
+
+    const { error } = await supabase
       .from('user_telegram_sessions')
       .update({ otp_code: otp.trim(), status: 'VERIFY_OTP', error_msg: null })
       .eq('user_id', userId);
+
+    if (error) {
+      setBusy(false);
+      setErrorMsg('Supabase Update Error: ' + error.message);
+      return;
+    }
     setStatus('VERIFY_OTP');
   };
 
@@ -85,10 +128,17 @@ export default function TelegramConnect({ onClose }) {
     if (!userId || !twoFa.trim()) return;
     setBusy(true);
     setErrorMsg('');
-    await supabase
+
+    const { error } = await supabase
       .from('user_telegram_sessions')
       .update({ two_fa_password: twoFa.trim(), status: 'VERIFY_2FA', error_msg: null })
       .eq('user_id', userId);
+
+    if (error) {
+      setBusy(false);
+      setErrorMsg('Supabase Update Error: ' + error.message);
+      return;
+    }
     setStatus('VERIFY_2FA');
   };
 
@@ -107,7 +157,7 @@ export default function TelegramConnect({ onClose }) {
 
   return (
     <div className="fixed inset-0 z-50 bg-slate-950/70 backdrop-blur-sm flex items-end sm:items-center justify-center p-0 sm:p-4">
-      <div className="bg-white w-full sm:max-w-md rounded-t-3xl sm:rounded-2xl shadow-2xl border border-slate-200 p-6 relative animate-in fade-in duration-200">
+      <div className="bg-white w-full sm:max-w-md rounded-t-3xl sm:rounded-2xl shadow-2xl border border-slate-200 p-6 relative">
         <button
           onClick={onClose}
           className="absolute top-4 right-4 w-9 h-9 rounded-full bg-slate-100 hover:bg-slate-200 flex items-center justify-center text-slate-600"
@@ -126,7 +176,7 @@ export default function TelegramConnect({ onClose }) {
         </div>
 
         {errorMsg && (
-          <div className="mb-4 p-3 rounded-xl bg-red-50 border border-red-200 text-xs text-red-700 font-medium">
+          <div className="mb-4 p-3 rounded-xl bg-red-50 border border-red-200 text-xs text-red-700 font-medium break-words">
             {errorMsg}
           </div>
         )}
