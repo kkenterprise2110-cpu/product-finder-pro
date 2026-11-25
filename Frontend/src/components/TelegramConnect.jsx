@@ -2,106 +2,57 @@
 import { supabase } from '../lib/supabase';
 import { X, Send, Smartphone, KeyRound, ShieldCheck, CheckCircle2, Loader2, LogOut } from 'lucide-react';
 
+const BACKEND_URL = 'https://telegram-product-sync.onrender.com';
+
 export default function TelegramConnect({ onClose }) {
   const [userId, setUserId] = useState(null);
   const [phone, setPhone] = useState('+91');
   const [otp, setOtp] = useState('');
   const [twoFa, setTwoFa] = useState('');
-  const [status, setStatus] = useState('IDLE');
+  const [step, setStep] = useState('PHONE'); // PHONE | OTP | 2FA | CONNECTED
   const [errorMsg, setErrorMsg] = useState('');
   const [busy, setBusy] = useState(false);
 
   useEffect(() => {
-    supabase.auth.getUser().then(async ({ data, error }) => {
-      if (error || !data?.user) {
-        setErrorMsg('User login session nathi mali. Ek var Logout kari fari login karo.');
-        return;
-      }
+    supabase.auth.getUser().then(async ({ data }) => {
+      if (!data?.user) return;
       const uid = data.user.id;
       setUserId(uid);
 
-      const { data: row, error: fetchErr } = await supabase
+      const { data: row } = await supabase
         .from('user_telegram_sessions')
-        .select('*')
+        .select('phone_number, status')
         .eq('user_id', uid)
         .maybeSingle();
 
-      if (fetchErr) {
-        setErrorMsg('Table Error: ' + fetchErr.message);
-        return;
-      }
-
-      if (row) {
+      if (row?.status === 'CONNECTED') {
         if (row.phone_number) setPhone(row.phone_number);
-        setStatus(row.status || 'IDLE');
-        setErrorMsg(row.error_msg || '');
+        setStep('CONNECTED');
       }
     });
   }, []);
 
-  useEffect(() => {
-    if (!userId) return;
-    const interval = setInterval(async () => {
-      const { data: row } = await supabase
-        .from('user_telegram_sessions')
-        .select('*')
-        .eq('user_id', userId)
-        .maybeSingle();
-
-      if (row) {
-        setStatus(row.status || 'IDLE');
-        setErrorMsg(row.error_msg || '');
-        if (['OTP_SENT', 'NEED_2FA', 'CONNECTED', 'ERROR'].includes(row.status)) {
-          setBusy(false);
-        }
-      }
-    }, 2000);
-
-    return () => clearInterval(interval);
-  }, [userId]);
-
   const handleSendOtp = async (e) => {
     e.preventDefault();
-    if (!userId) {
-      setErrorMsg('User ID missing. Page refresh karo.');
-      return;
-    }
-    if (phone.trim().length < 10) {
-      setErrorMsg('Sacho mobile number nakho (+91 sathe).');
-      return;
-    }
+    if (!userId) return setErrorMsg('Please login again.');
+    if (phone.trim().length < 10) return setErrorMsg('Sacho mobile number nakho (+91 sathe).');
 
     setBusy(true);
     setErrorMsg('');
-
-    const { error } = await supabase.from('user_telegram_sessions').upsert(
-      {
-        user_id: userId,
-        phone_number: phone.trim(),
-        status: 'SEND_OTP',
-        otp_code: null,
-        two_fa_password: null,
-        error_msg: null,
-      },
-      { onConflict: 'user_id' }
-    );
-
-    if (error) {
-      setBusy(false);
-      setErrorMsg('Supabase Save Error: ' + error.message);
-      return;
-    }
-
-    setStatus('SEND_OTP');
-
-    setTimeout(() => {
-      setBusy((prev) => {
-        if (prev) {
-          setErrorMsg('Render server response nathi aapyo. Render Dashboard ma Logs check karo.');
-        }
-        return false;
+    try {
+      const res = await fetch(`${BACKEND_URL}/send-otp`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ user_id: userId, phone: phone.trim() }),
       });
-    }, 15000);
+      const data = await res.json();
+      if (!data.ok) throw new Error(data.error || 'OTP failed');
+      setStep('OTP');
+    } catch (err) {
+      setErrorMsg(err.message === 'Failed to fetch' ? 'Render server wake up thay che, 15 second pachi fari click karo.' : err.message);
+    } finally {
+      setBusy(false);
+    }
   };
 
   const handleVerifyOtp = async (e) => {
@@ -109,18 +60,24 @@ export default function TelegramConnect({ onClose }) {
     if (!userId || !otp.trim()) return;
     setBusy(true);
     setErrorMsg('');
-
-    const { error } = await supabase
-      .from('user_telegram_sessions')
-      .update({ otp_code: otp.trim(), status: 'VERIFY_OTP', error_msg: null })
-      .eq('user_id', userId);
-
-    if (error) {
+    try {
+      const res = await fetch(`${BACKEND_URL}/verify-otp`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ user_id: userId, otp: otp.trim() }),
+      });
+      const data = await res.json();
+      if (!data.ok) throw new Error(data.error || 'Invalid OTP');
+      if (data.status === 'NEED_2FA') {
+        setStep('2FA');
+      } else {
+        setStep('CONNECTED');
+      }
+    } catch (err) {
+      setErrorMsg(err.message);
+    } finally {
       setBusy(false);
-      setErrorMsg('Supabase Update Error: ' + error.message);
-      return;
     }
-    setStatus('VERIFY_OTP');
   };
 
   const handleVerify2FA = async (e) => {
@@ -128,18 +85,20 @@ export default function TelegramConnect({ onClose }) {
     if (!userId || !twoFa.trim()) return;
     setBusy(true);
     setErrorMsg('');
-
-    const { error } = await supabase
-      .from('user_telegram_sessions')
-      .update({ two_fa_password: twoFa.trim(), status: 'VERIFY_2FA', error_msg: null })
-      .eq('user_id', userId);
-
-    if (error) {
+    try {
+      const res = await fetch(`${BACKEND_URL}/verify-2fa`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ user_id: userId, password: twoFa.trim() }),
+      });
+      const data = await res.json();
+      if (!data.ok) throw new Error(data.error || 'Wrong 2FA password');
+      setStep('CONNECTED');
+    } catch (err) {
+      setErrorMsg(err.message);
+    } finally {
       setBusy(false);
-      setErrorMsg('Supabase Update Error: ' + error.message);
-      return;
     }
-    setStatus('VERIFY_2FA');
   };
 
   const handleDisconnect = async () => {
@@ -147,9 +106,9 @@ export default function TelegramConnect({ onClose }) {
     setBusy(true);
     await supabase
       .from('user_telegram_sessions')
-      .update({ status: 'DISCONNECTED', session_string: null, otp_code: null, two_fa_password: null })
+      .update({ status: 'DISCONNECTED', session_string: null })
       .eq('user_id', userId);
-    setStatus('IDLE');
+    setStep('PHONE');
     setOtp('');
     setTwoFa('');
     setBusy(false);
@@ -171,7 +130,7 @@ export default function TelegramConnect({ onClose }) {
           </div>
           <div>
             <h2 className="text-lg font-bold text-slate-900">Telegram Connection</h2>
-            <p className="text-xs text-slate-500">24x7 Cloud Auto-Sync (One-time setup)</p>
+            <p className="text-xs text-slate-500">Direct 24x7 Cloud Sync</p>
           </div>
         </div>
 
@@ -181,14 +140,14 @@ export default function TelegramConnect({ onClose }) {
           </div>
         )}
 
-        {status === 'CONNECTED' ? (
+        {step === 'CONNECTED' ? (
           <div className="text-center py-4">
             <div className="w-14 h-14 rounded-full bg-emerald-100 text-emerald-600 flex items-center justify-center mx-auto mb-3">
               <CheckCircle2 className="w-8 h-8" />
             </div>
             <h3 className="text-base font-bold text-slate-900">Telegram Connected!</h3>
             <p className="text-xs text-slate-500 mt-1 mb-5">
-              Connected with <b>{phone}</b>. Tamari badhi channels 24x7 auto-sync thai rahi che.
+              Connected with <b>{phone}</b>. Tamari badhi channels sync thai rahi che.
             </p>
             <div className="flex gap-2">
               <button
@@ -207,7 +166,7 @@ export default function TelegramConnect({ onClose }) {
               </button>
             </div>
           </div>
-        ) : status === 'OTP_SENT' || status === 'VERIFY_OTP' ? (
+        ) : step === 'OTP' ? (
           <form onSubmit={handleVerifyOtp} className="space-y-4">
             <p className="text-xs text-slate-600">
               Telegram app ma <b>{phone}</b> par aavelo 5-digit OTP nakho:
@@ -232,7 +191,7 @@ export default function TelegramConnect({ onClose }) {
               <span>{busy ? 'Verifying OTP...' : 'Verify & Connect'}</span>
             </button>
           </form>
-        ) : status === 'NEED_2FA' || status === 'VERIFY_2FA' ? (
+        ) : step === '2FA' ? (
           <form onSubmit={handleVerify2FA} className="space-y-4">
             <p className="text-xs text-slate-600">
               Tamara Telegram account no 2-Step Verification password nakho:
@@ -279,7 +238,7 @@ export default function TelegramConnect({ onClose }) {
               className="w-full bg-blue-600 hover:bg-blue-700 text-white py-3 rounded-xl text-sm font-semibold flex items-center justify-center gap-2 shadow-md shadow-blue-600/20"
             >
               {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : null}
-              <span>{busy ? 'Sending OTP (Wait 10s)...' : 'Send Telegram OTP'}</span>
+              <span>{busy ? 'Sending OTP...' : 'Send Telegram OTP'}</span>
             </button>
           </form>
         )}

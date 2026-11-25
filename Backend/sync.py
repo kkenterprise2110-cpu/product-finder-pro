@@ -1,292 +1,256 @@
 ﻿import os
 import re
-import io
 import asyncio
 import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, timedelta, timezone
-from PIL import Image
-from dotenv import load_dotenv
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import json
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
-from telethon.tl.types import Channel
-from supabase import create_client
+from supabase import create_client, Client
+from dotenv import load_dotenv
 
 load_dotenv()
 
-API_ID = int(os.getenv("TELEGRAM_API_ID"))
-API_HASH = os.getenv("TELEGRAM_API_HASH")
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_SECRET_KEY") or os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+API_ID = int(os.getenv("TELEGRAM_API_ID", "0"))
+API_HASH = os.getenv("TELEGRAM_API_HASH", "")
+SUPABASE_URL = os.getenv("SUPABASE_URL", "")
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_KEY", "")
 
-supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
+pending_clients = {}
 active_workers = {}
-pending_auth = {}
+main_loop = None
 
-class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"OK - Multi-User Telegram Sync Running 24x7")
-    def log_message(self, format, *args):
-        pass
-
-def start_health_server():
-    port = int(os.environ.get("PORT", 10000))
-    server = HTTPServer(("0.0.0.0", port), HealthHandler)
-    server.serve_forever()
-
-def get_last_message_id(user_id, channel_id):
-    try:
-        res = (
-            supabase.table("products")
-            .select("message_id")
-            .eq("user_id", user_id)
-            .eq("channel_id", str(channel_id))
-            .order("message_id", desc=True)
-            .limit(1)
-            .execute()
-        )
-        if res.data:
-            return int(res.data[0]["message_id"])
-    except Exception:
-        pass
-    return 0
-
-def compute_dhash_bytes(img_bytes):
-    img = Image.open(io.BytesIO(img_bytes)).convert("L").resize((8, 8), Image.Resampling.LANCZOS)
-    pixels = list(img.getdata())
-    avg = sum(pixels) / 64.0
-    bits = "".join("1" if p >= avg else "0" for p in pixels)
-    return "".join(f"{int(bits[i:i+4], 2):x}" for i in range(0, 64, 4))
-
-def parse_message(text):
+def extract_price(text: str):
     if not text:
-        return None, None, "IN_STOCK"
-    clean_lines = [line.strip() for line in text.splitlines() if line.strip()]
-    product_name = clean_lines[0][:180] if clean_lines else "Product"
+        return None
+    patterns = [
+        r'(?:₹|rs\.?|inr|price|rate|@)\s*[:\-]?\s*([0-9]{1,3}(?:,[0-9]{2,3})+|[0-9]{2,6})(?:\.[0-9]{1,2})?',
+        r'([0-9]{1,3}(?:,[0-9]{2,3})+|[0-9]{3,6})\s*(?:/-|rs|inr|₹|only)'
+    ]
+    for pat in patterns:
+        m = re.search(pat, text, re.IGNORECASE)
+        if m:
+            raw_num = m.group(1).replace(",", "")
+            try:
+                val = float(raw_num)
+                if 10 <= val <= 500000:
+                    return val
+            except:
+                pass
+    return None
 
-    price = None
-    price_match = re.search(r'(?:₹|rs\.?|inr|price|rate|@)\s*[:\-]?\s*(\d+(?:\.\d{1,2})?)', text, re.IGNORECASE)
-    if not price_match:
-        price_match = re.search(r'\b(\d{2,5})\s*(?:/-|rs|inr)\b', text, re.IGNORECASE)
-    if price_match:
-        try:
-            price = float(price_match.group(1))
-        except Exception:
-            price = None
-
+def parse_message(text: str):
+    if not text:
+        return "Untitled Product", None, "IN_STOCK"
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    title = lines[0][:120] if lines else "Product Item"
+    price = extract_price(text)
     lower = text.lower()
-    is_out = any(k in lower for k in ["stock out", "out of stock", "sold out", "not available", "no stock", "booked"])
-    status = "STOCK_OUT" if is_out else "IN_STOCK"
-    return product_name, price, status
+    out_words = ["sold out", "stock out", "out of stock", "not available", "booked", "finished"]
+    status = "STOCK_OUT" if any(w in lower for w in out_words) else "IN_STOCK"
+    return title, price, status
 
-async def process_message(user_id, client, msg, entity, channel_title):
-    if not msg or (not msg.text and not msg.photo):
-        return
-    text = msg.text or ""
-    product_name, price, status = parse_message(text)
-
-    if getattr(entity, "username", None):
-        tg_link = f"https://t.me/{entity.username}/{msg.id}"
-    else:
-        tg_link = f"https://t.me/c/{entity.id}/{msg.id}"
-
-    image_url = None
-    image_hash = None
-
-    if msg.photo:
-        try:
-            img_bytes = await client.download_media(msg.photo, file=bytes)
-            if img_bytes:
-                image_hash = compute_dhash_bytes(img_bytes)
-                file_path = f"{user_id}/{entity.id}/{msg.id}.jpg"
-                supabase.storage.from_("product-images").upload(
-                    file_path,
-                    img_bytes,
-                    {"content-type": "image/jpeg", "upsert": "true"},
-                )
-                image_url = supabase.storage.from_("product-images").get_public_url(file_path)
-        except Exception:
-            pass
-
-    posted_at = msg.date.astimezone(timezone.utc).isoformat() if msg.date else datetime.now(timezone.utc).isoformat()
-
-    data = {
-        "user_id": user_id,
-        "channel_id": str(entity.id),
-        "channel_name": channel_title,
-        "message_id": msg.id,
-        "product_name": product_name or "Product",
-        "raw_text": text[:2000],
-        "price": price,
-        "status": status,
-        "image_url": image_url,
-        "image_hash": image_hash,
-        "telegram_link": tg_link,
-        "posted_at": posted_at,
-    }
-
-    try:
-        supabase.table("products").upsert(data, on_conflict="user_id,channel_id,message_id").execute()
-        print(f"[{user_id[:6]}][{status}] {channel_title} | {product_name[:30]} | ₹{price}")
-    except Exception as e:
-        print(f"[DB ERR] {e}")
-
-async def sync_channel_smart(user_id, client, entity, title):
-    cid = str(entity.id)
-    last_id = get_last_message_id(user_id, cid)
-
-    if last_id > 0:
-        async for msg in client.iter_messages(entity, min_id=last_id, reverse=True):
-            await process_message(user_id, client, msg, entity, title)
-    else:
-        cutoff = datetime.now(timezone.utc) - timedelta(days=90)
-        print(f"[{user_id[:6]}][90-DAY SYNC] {title}...")
-        async for msg in client.iter_messages(entity, offset_date=datetime.now(timezone.utc), reverse=False):
-            if msg.date and msg.date < cutoff:
-                break
-            await process_message(user_id, client, msg, entity, title)
-
-async def run_user_worker(user_id, session_string):
-    client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
+async def sync_user_channels(user_id: str, session_str: str):
+    client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
     await client.connect()
     if not await client.is_user_authorized():
-        supabase.table("user_telegram_sessions").update({"status": "DISCONNECTED"}).eq("user_id", user_id).execute()
+        print(f"[AUTH EXPIRED] User {user_id[:8]}")
         return
 
-    print(f"[WORKER ACTIVE] User {user_id[:8]}")
-    checked = set()
+    print(f"[SYNC START] User {user_id[:8]}")
+    cutoff = datetime.now(timezone.utc) - timedelta(days=90)
+
+    async for dialog in client.iter_dialogs():
+        if not dialog.is_channel:
+            continue
+        ch_name = dialog.name or "Channel"
+        ch_username = getattr(dialog.entity, "username", None)
+        try:
+            async for msg in client.iter_messages(dialog.id, offset_date=datetime.now(timezone.utc), reverse=False, limit=150):
+                if msg.date < cutoff:
+                    break
+                text = msg.message or ""
+                if not text and not msg.photo:
+                    continue
+                title, price, status = parse_message(text)
+                tg_link = f"https://t.me/{ch_username}/{msg.id}" if ch_username else None
+                unique_key = f"{user_id}_{dialog.id}_{msg.id}"
+
+                supabase.table("products").upsert({
+                    "id": unique_key,
+                    "user_id": user_id,
+                    "channel_name": ch_name,
+                    "product_name": title,
+                    "raw_text": text[:1000],
+                    "price": price,
+                    "status": status,
+                    "telegram_link": tg_link,
+                    "posted_at": msg.date.isoformat()
+                }, on_conflict="id").execute()
+        except Exception as e:
+            print(f"[CHANNEL ERR] {ch_name}: {e}")
 
     @client.on(events.NewMessage)
-    async def on_new(event):
+    async def on_new_msg(event):
+        if not event.is_channel:
+            return
         chat = await event.get_chat()
-        if isinstance(chat, Channel) and chat.broadcast:
-            await process_message(user_id, client, event.message, chat, chat.title or str(chat.id))
+        ch_name = getattr(chat, "title", "Channel")
+        ch_username = getattr(chat, "username", None)
+        text = event.message.message or ""
+        if not text and not event.message.photo:
+            return
+        title, price, status = parse_message(text)
+        tg_link = f"https://t.me/{ch_username}/{event.message.id}" if ch_username else None
+        unique_key = f"{user_id}_{chat.id}_{event.message.id}"
+        supabase.table("products").upsert({
+            "id": unique_key,
+            "user_id": user_id,
+            "channel_name": ch_name,
+            "product_name": title,
+            "raw_text": text[:1000],
+            "price": price,
+            "status": status,
+            "telegram_link": tg_link,
+            "posted_at": event.message.date.isoformat()
+        }, on_conflict="id").execute()
 
-    @client.on(events.MessageEdited)
-    async def on_edit(event):
-        chat = await event.get_chat()
-        if isinstance(chat, Channel) and chat.broadcast:
-            await process_message(user_id, client, event.message, chat, chat.title or str(chat.id))
+    print(f"[24x7 LISTENING] User {user_id[:8]}")
+    await client.run_until_disconnected()
 
-    while user_id in active_workers:
+async def api_send_otp(user_id: str, phone: str):
+    if user_id in pending_clients:
         try:
-            async for dialog in client.iter_dialogs():
-                entity = dialog.entity
-                if isinstance(entity, Channel) and entity.broadcast:
-                    cid = str(entity.id)
-                    if cid not in checked:
-                        checked.add(cid)
-                        uname = f"@{entity.username}" if getattr(entity, "username", None) else cid
-                        title = dialog.name or uname
-                        supabase.table("channels").upsert(
-                            {
-                                "user_id": user_id,
-                                "channel_username": uname,
-                                "channel_title": title,
-                                "is_active": True,
-                            },
-                            on_conflict="user_id,channel_username",
-                        ).execute()
-                        await sync_channel_smart(user_id, client, entity, title)
-        except Exception as e:
-            print(f"[WATCH ERR {user_id[:6]}] {e}")
-        await asyncio.sleep(20)
+            await pending_clients[user_id]["client"].disconnect()
+        except:
+            pass
+    client = TelegramClient(StringSession(), API_ID, API_HASH)
+    await client.connect()
+    sent = await client.send_code_request(phone)
+    pending_clients[user_id] = {
+        "client": client,
+        "phone": phone,
+        "phone_code_hash": sent.phone_code_hash
+    }
+    return {"ok": True, "status": "OTP_SENT"}
 
-async def handle_auth_requests():
-    while True:
+async def api_verify_otp(user_id: str, otp: str):
+    if user_id not in pending_clients:
+        return {"ok": False, "error": "Session expired. Fari OTP moklo."}
+    info = pending_clients[user_id]
+    client = info["client"]
+    try:
+        await client.sign_in(phone=info["phone"], code=otp, phone_code_hash=info["phone_code_hash"])
+    except Exception as e:
+        if "SessionPasswordNeededError" in type(e).__name__ or "password" in str(e).lower():
+            return {"ok": True, "status": "NEED_2FA"}
+        return {"ok": False, "error": str(e)}
+
+    s_str = client.session.save()
+    await client.disconnect()
+    del pending_clients[user_id]
+
+    supabase.table("user_telegram_sessions").upsert({
+        "user_id": user_id,
+        "phone_number": info["phone"],
+        "session_string": s_str,
+        "status": "CONNECTED"
+    }, on_conflict="user_id").execute()
+
+    if user_id not in active_workers:
+        active_workers[user_id] = asyncio.create_task(sync_user_channels(user_id, s_str))
+    return {"ok": True, "status": "CONNECTED"}
+
+async def api_verify_2fa(user_id: str, password: str):
+    if user_id not in pending_clients:
+        return {"ok": False, "error": "Session expired. Fari OTP moklo."}
+    info = pending_clients[user_id]
+    client = info["client"]
+    try:
+        await client.sign_in(password=password)
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+    s_str = client.session.save()
+    await client.disconnect()
+    del pending_clients[user_id]
+
+    supabase.table("user_telegram_sessions").upsert({
+        "user_id": user_id,
+        "phone_number": info["phone"],
+        "session_string": s_str,
+        "status": "CONNECTED"
+    }, on_conflict="user_id").execute()
+
+    if user_id not in active_workers:
+        active_workers[user_id] = asyncio.create_task(sync_user_channels(user_id, s_str))
+    return {"ok": True, "status": "CONNECTED"}
+
+class APIHandler(BaseHTTPRequestHandler):
+    def _send_json(self, code, payload):
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.end_headers()
+        self.wfile.write(json.dumps(payload).encode())
+
+    def do_OPTIONS(self):
+        self._send_json(200, {"ok": True})
+
+    def do_GET(self):
+        self._send_json(200, {"status": "OK - Multi-User Telegram Sync Running 24x7"})
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        body = json.loads(self.rfile.read(length).decode() or "{}")
+        user_id = body.get("user_id")
+
         try:
-            res = supabase.table("user_telegram_sessions").select("*").execute()
-            for row in res.data or []:
-                uid = row["user_id"]
-                status = row.get("status")
-                phone = (row.get("phone_number") or "").strip()
-                otp = (row.get("otp_code") or "").strip()
-                pw = (row.get("two_fa_password") or "").strip()
-
-                if status == "SEND_OTP" and phone:
-                    try:
-                        c = TelegramClient(StringSession(), API_ID, API_HASH)
-                        await c.connect()
-                        sent = await c.send_code_request(phone)
-                        pending_auth[uid] = {"client": c, "phone": phone, "hash": sent.phone_code_hash}
-                        supabase.table("user_telegram_sessions").update({
-                            "status": "OTP_SENT",
-                            "error_msg": None
-                        }).eq("user_id", uid).execute()
-                        print(f"[OTP SENT] {phone}")
-                    except Exception as e:
-                        supabase.table("user_telegram_sessions").update({
-                            "status": "ERROR",
-                            "error_msg": str(e)
-                        }).eq("user_id", uid).execute()
-
-                elif status == "VERIFY_OTP" and otp and uid in pending_auth:
-                    info = pending_auth[uid]
-                    c = info["client"]
-                    try:
-                        await c.sign_in(phone=info["phone"], code=otp, phone_code_hash=info["hash"])
-                        s_str = c.session.save()
-                        await c.disconnect()
-                        del pending_auth[uid]
-                        supabase.table("user_telegram_sessions").update({
-                            "session_string": s_str,
-                            "status": "CONNECTED",
-                            "otp_code": None,
-                            "error_msg": None
-                        }).eq("user_id", uid).execute()
-                        print(f"[CONNECTED] User {uid[:8]}")
-                    except Exception as e:
-                        err = str(e)
-                        if "Two-steps verification" in err or "SessionPasswordNeededError" in type(e).__name__:
-                            supabase.table("user_telegram_sessions").update({
-                                "status": "NEED_2FA",
-                                "error_msg": "Enter 2-Step Password"
-                            }).eq("user_id", uid).execute()
-                        else:
-                            supabase.table("user_telegram_sessions").update({
-                                "status": "OTP_SENT",
-                                "error_msg": err
-                            }).eq("user_id", uid).execute()
-
-                elif status == "VERIFY_2FA" and pw and uid in pending_auth:
-                    c = pending_auth[uid]["client"]
-                    try:
-                        await c.sign_in(password=pw)
-                        s_str = c.session.save()
-                        await c.disconnect()
-                        del pending_auth[uid]
-                        supabase.table("user_telegram_sessions").update({
-                            "session_string": s_str,
-                            "status": "CONNECTED",
-                            "otp_code": None,
-                            "two_fa_password": None,
-                            "error_msg": None
-                        }).eq("user_id", uid).execute()
-                        print(f"[CONNECTED 2FA] User {uid[:8]}")
-                    except Exception as e:
-                        supabase.table("user_telegram_sessions").update({
-                            "status": "NEED_2FA",
-                            "error_msg": str(e)
-                        }).eq("user_id", uid).execute()
-
-                elif status == "CONNECTED" and row.get("session_string") and uid not in active_workers:
-                    active_workers[uid] = asyncio.create_task(run_user_worker(uid, row["session_string"]))
-
-                elif status == "DISCONNECTED" and uid in active_workers:
-                    active_workers[uid].cancel()
-                    del active_workers[uid]
-
+            if self.path == "/send-otp":
+                fut = asyncio.run_coroutine_threadsafe(api_send_otp(user_id, body.get("phone")), main_loop)
+                res = fut.result(timeout=25)
+                self._send_json(200, res)
+            elif self.path == "/verify-otp":
+                fut = asyncio.run_coroutine_threadsafe(api_verify_otp(user_id, body.get("otp")), main_loop)
+                res = fut.result(timeout=25)
+                self._send_json(200, res)
+            elif self.path == "/verify-2fa":
+                fut = asyncio.run_coroutine_threadsafe(api_verify_2fa(user_id, body.get("password")), main_loop)
+                res = fut.result(timeout=25)
+                self._send_json(200, res)
+            else:
+                self._send_json(404, {"ok": False, "error": "Not found"})
         except Exception as e:
-            print(f"[LOOP ERR] {e}")
-        await asyncio.sleep(2)
+            self._send_json(500, {"ok": False, "error": str(e)})
+
+def start_http():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), APIHandler)
+    server.serve_forever()
 
 async def main():
-    threading.Thread(target=start_health_server, daemon=True).start()
-    print("=== MULTI-USER 24x7 TELEGRAM SYNC ENGINE STARTED ===")
-    await handle_auth_requests()
+    global main_loop
+    main_loop = asyncio.get_running_loop()
+    threading.Thread(target=start_http, daemon=True).start()
+    print("HTTP API + 24x7 Sync Engine Started!")
+
+    try:
+        res = supabase.table("user_telegram_sessions").select("*").eq("status", "CONNECTED").execute()
+        for row in (res.data or []):
+            uid = row["user_id"]
+            s_str = row.get("session_string")
+            if s_str and uid not in active_workers:
+                active_workers[uid] = asyncio.create_task(sync_user_channels(uid, s_str))
+    except Exception as e:
+        print("Boot resume warning:", e)
+
+    while True:
+        await asyncio.sleep(30)
 
 if __name__ == "__main__":
     asyncio.run(main())
