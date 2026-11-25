@@ -1,5 +1,5 @@
 ﻿import { useState, useEffect } from 'react';
-import { supabase } from './supabaseClient';
+import { supabase } from './lib/supabase';
 import Login from './pages/Login';
 import Search from './pages/Search';
 import Channels from './pages/Channels';
