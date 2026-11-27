@@ -20,6 +20,8 @@ export default function Dashboard({ session }) {
   const [photoSort, setPhotoSort] = useState('match');
   const [channelId, setChannelId] = useState('');
   const [photo, setPhoto] = useState(null); // { preview, rows, loading }
+  const [liveRows, setLiveRows] = useState([]);
+  const [liveSearching, setLiveSearching] = useState(false);
   const [modal, setModal] = useState(null); // 'tg' | 'channels'
   const [status, setStatus] = useState(null);
   const [statusErr, setStatusErr] = useState('');
@@ -30,7 +32,7 @@ export default function Dashboard({ session }) {
   const fileRef = useRef(null);
   const sentinel = useRef(null);
 
-  const dq = useDebounce(q, 300);
+  const dq = useDebounce(q, 250);
 
   const toast = useCallback((msg, isErr) => {
     const id = Math.random();
@@ -59,9 +61,55 @@ export default function Dashboard({ session }) {
     return () => { supabase.removeChannel(ch); };
   }, [uid]);
 
-  // ---------------------------------------------------------------- products
+  // ---------------------------------------------------------------- products (DB + Live Telegram)
   const filters = useMemo(() => ({ q: dq, hideOut, sort, channelId: channelId ? Number(channelId) : null }), [dq, hideOut, sort, channelId]);
   const list = useProducts(filters, version);
+
+  useEffect(() => {
+    const term = dq.trim();
+    if (!term || photo || status?.status !== 'CONNECTED') {
+      setLiveRows([]);
+      setLiveSearching(false);
+      return;
+    }
+    const ac = new AbortController();
+    setLiveSearching(true);
+    api.liveSearch(term, channelId ? Number(channelId) : null, ac.signal)
+      .then((res) => {
+        if (!ac.signal.aborted) {
+          setLiveRows(res.products || []);
+          setLiveSearching(false);
+        }
+      })
+      .catch((err) => {
+        if (!ac.signal.aborted && err.name !== 'AbortError') {
+          setLiveSearching(false);
+        }
+      });
+    return () => ac.abort();
+  }, [dq, channelId, photo, status?.status]);
+
+  // Merge DB items + Live Telegram search results without duplicates
+  const mergedSearchItems = useMemo(() => {
+    if (!dq.trim()) return list.items;
+    const map = new Map();
+    for (const item of list.items) map.set(item.id, item);
+    for (const item of liveRows) {
+      const ex = map.get(item.id);
+      if (!ex || (!ex.image_path && item.image_path)) {
+        map.set(item.id, item);
+      }
+    }
+    let arr = Array.from(map.values());
+    if (hideOut) arr = arr.filter((x) => x.status === 'IN_STOCK');
+    if (channelId) arr = arr.filter((x) => x.channel_id === Number(channelId));
+    const by = {
+      price_asc: (a, b) => (a.price ?? Infinity) - (b.price ?? Infinity),
+      price_desc: (a, b) => (b.price ?? -Infinity) - (a.price ?? -Infinity),
+      new: (a, b) => new Date(b.posted_at) - new Date(a.posted_at),
+    }[sort];
+    return by ? [...arr].sort(by) : arr;
+  }, [dq, list.items, liveRows, hideOut, channelId, sort]);
 
   const photoItems = useMemo(() => {
     if (!photo?.rows) return [];
@@ -75,8 +123,8 @@ export default function Dashboard({ session }) {
     return [...r].sort(by);
   }, [photo, hideOut, photoSort, channelId]);
 
-  const items = photo ? photoItems : list.items;
-  const loading = photo ? photo.loading : list.loading;
+  const items = photo ? photoItems : mergedSearchItems;
+  const loading = photo ? photo.loading : (list.loading && items.length === 0 && !liveSearching);
   const urlFor = useSignedUrls(items.map((i) => i.image_path).filter(Boolean));
 
   const bestId = useMemo(() => {
@@ -146,7 +194,8 @@ export default function Dashboard({ session }) {
             <div className="search-row">
               <div className="search-box">
                 <Search size={18} />
-                <input type="search" value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search products…" title="Last 90 days na products ma search" aria-label="Search products" disabled={!!photo} />
+                <input type="search" value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search any product live across all channels…" aria-label="Search products" disabled={!!photo} />
+                {liveSearching && <Loader2 size={16} className="spin" />}
                 {q && !photo && <button className="icon-btn clear" onClick={() => setQ('')} aria-label="Clear"><X size={16} /></button>}
               </div>
               <button className="btn primary" onClick={() => fileRef.current?.click()} disabled={photo?.loading}>
@@ -184,7 +233,7 @@ export default function Dashboard({ session }) {
           </div>
         </div>
 
-        {fresh > 0 && !photo && (
+        {fresh > 0 && !photo && !dq.trim() && (
           <button className="btn primary sm new-pill" onClick={refreshAll}><RefreshCw size={14} />{fresh} new product{fresh > 1 ? 's' : ''} — show</button>
         )}
 
@@ -202,7 +251,7 @@ export default function Dashboard({ session }) {
           <div className="banner warn"><span>{list.error}</span><button className="btn sm" onClick={list.reload}>Retry</button></div>
         )}
 
-        {loading ? (
+        {loading || (liveSearching && items.length === 0) ? (
           <div className="grid" aria-busy="true">{Array.from({ length: 8 }, (_, i) => <CardSkeleton key={i} />)}</div>
         ) : items.length === 0 ? (
           <div className="empty">
@@ -230,7 +279,7 @@ export default function Dashboard({ session }) {
         ) : (
           <>
             <div className="results-meta">
-              <span>{items.length}{!photo && list.hasMore ? '+' : ''} product{items.length === 1 ? '' : 's'}</span>
+              <span>{items.length}{!photo && !dq.trim() && list.hasMore ? '+' : ''} product{items.length === 1 ? '' : 's'}{liveSearching ? ' (live searching…)' : ''}</span>
               <button className="btn ghost sm" onClick={refreshAll}><RefreshCw size={14} />Refresh</button>
             </div>
             <div className="grid">

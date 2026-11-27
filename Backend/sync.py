@@ -1,5 +1,6 @@
-﻿"""Product Finder Pro - backend (FastAPI + Telethon)."""
+﻿"""Product Finder Pro - backend (FastAPI + Telethon) with Live Telegram Search."""
 import asyncio
+import gc
 import io
 import logging
 import os
@@ -21,7 +22,7 @@ from fastapi.responses import JSONResponse
 from PIL import Image, ImageOps
 from pydantic import BaseModel, Field
 from supabase import Client, create_client
-from telethon import TelegramClient, errors, events
+from telethon import TelegramClient, errors, events, functions, types
 from telethon.sessions import StringSession
 
 from parsing import parse_message
@@ -52,8 +53,8 @@ ALLOWED_ORIGINS = [
     for o in _env("ALLOWED_ORIGINS", default="https://product-finder-pro.vercel.app").split(",")
     if o.strip()
 ]
-# Full channel history sync (no 90-day limit)
-MAX_MSGS = int(_env("MAX_MSGS_PER_CHANNEL", default="50000"))
+# Safe limit for Render 512MB RAM; older posts are fetched instantly via /live-search
+MAX_MSGS = int(_env("MAX_MSGS_PER_CHANNEL", default="1500"))
 BUCKET = "product-thumbs"
 OTP_TTL = 600
 
@@ -213,11 +214,11 @@ class ChannelMeta:
     username: Optional[str]
 
 
-MEDIA_SEM = asyncio.Semaphore(2)  # 2 concurrent downloads so Telegram never drops connections
+MEDIA_SEM = asyncio.Semaphore(3)
 
 
 class Worker:
-    """One Telegram connection per user: full channel sync + live updates."""
+    """One Telegram connection per user: live search + smart sync."""
 
     def __init__(self, uid: str, session_str: str):
         self.uid = uid
@@ -274,7 +275,7 @@ class Worker:
     async def _session(self):
         self.client = TelegramClient(
             StringSession(self.session_str), API_ID, API_HASH,
-            device_model="Product Finder Pro", app_version="2.0",
+            device_model="Product Finder Pro", app_version="2.1",
             flood_sleep_threshold=60, connection_retries=10, auto_reconnect=True,
         )
         await self.client.connect()
@@ -309,10 +310,14 @@ class Worker:
         return len(rows)
 
     async def _load_enabled(self):
-        res = await run(lambda: sb.table("user_channels").select("channel_id")
+        res = await run(lambda: sb.table("user_channels").select("channel_id,title,username")
                         .eq("user_id", self.uid).eq("enabled", True).execute())
-        self.enabled = {int(r["channel_id"]) for r in (res.data or [])}
-        for cid in self.enabled:
+        self.enabled = set()
+        for r in (res.data or []):
+            cid = int(r["channel_id"])
+            self.enabled.add(cid)
+            if cid not in self.meta:
+                self.meta[cid] = ChannelMeta(r.get("title") or "Channel", r.get("username"))
             self.enqueue(cid)
 
     def enqueue(self, cid: int):
@@ -343,7 +348,8 @@ class Worker:
             except Exception as e:
                 log.error("[%s] backfill %s failed: %s", self.uid[:8], cid, type(e).__name__)
             self.queued.discard(cid)
-            await asyncio.sleep(1)
+            gc.collect()
+            await asyncio.sleep(0.5)
 
     def _row(self, chat_id: int, msg_id: int, date: datetime, text: str) -> dict:
         meta = self.meta.get(chat_id) or ChannelMeta("Channel", None)
@@ -365,11 +371,112 @@ class Worker:
             except Exception as e:
                 log.error("[%s] upsert failed: %s", self.uid[:8], str(e)[:200])
 
+    async def live_search(self, query: str, channel_id: Optional[int] = None, limit: int = 40) -> List[dict]:
+        """Instant live search directly across Telegram channels (finds 2-year-old posts in 2s)."""
+        if not self.alive:
+            raise HTTPException(503, "Telegram connect thai rahyu che. 5 second pachi try karo.")
+
+        found_msgs = []
+        if channel_id:
+            async for m in self.client.iter_messages(channel_id, search=query, limit=limit):
+                if not getattr(m, "action", None):
+                    found_msgs.append(m)
+        else:
+            # Global search across all user's Telegram chats/channels in one fast RPC call
+            res = await self.client(functions.messages.SearchGlobalRequest(
+                q=query,
+                filter=types.InputMessagesFilterEmpty(),
+                min_date=None,
+                max_date=None,
+                offset_rate=0,
+                offset_peer=types.InputPeerEmpty(),
+                offset_id=0,
+                limit=min(limit * 2, 100),
+            ))
+            chats_map = {}
+            for ch in getattr(res, "chats", []):
+                # Convert raw channel/chat id to Telethon marked dialog id (-100...)
+                marked_id = int(f"-100{ch.id}") if isinstance(ch, types.Channel) else -int(ch.id)
+                chats_map[marked_id] = ch
+                if marked_id not in self.meta:
+                    self.meta[marked_id] = ChannelMeta(getattr(ch, "title", "Channel")[:200], getattr(ch, "username", None))
+
+            for m in getattr(res, "messages", []):
+                if isinstance(m, types.MessageEmpty) or getattr(m, "action", None):
+                    continue
+                peer = getattr(m, "peer_id", None)
+                cid = None
+                if isinstance(peer, types.PeerChannel):
+                    cid = int(f"-100{peer.channel_id}")
+                elif isinstance(peer, types.PeerChat):
+                    cid = -int(peer.chat_id)
+                if cid is None:
+                    continue
+                if self.enabled and cid not in self.enabled:
+                    continue
+                # Attach chat entity so download_media works seamlessly
+                if cid in chats_map:
+                    m._chat = chats_map[cid]
+                    m._chat_peer = peer
+                found_msgs.append((cid, m))
+
+        # Normalize into (cid, msg)
+        pairs = []
+        if channel_id:
+            pairs = [(channel_id, m) for m in found_msgs]
+        else:
+            pairs = found_msgs[:limit]
+
+        # If a matched message has no photo but is part of an album, grab sibling photo
+        final_items = []
+        for cid, m in pairs:
+            pm = m if has_visual(m) else None
+            if pm is None and getattr(m, "grouped_id", None):
+                try:
+                    nearby = await self.client.get_messages(cid, ids=list(range(max(1, m.id - 5), m.id + 6)))
+                    for nb in nearby:
+                        if nb and getattr(nb, "grouped_id", None) == m.grouped_id and has_visual(nb):
+                            pm = nb
+                            break
+                except Exception:
+                    pass
+            final_items.append((cid, m, pm))
+
+        # Check which ones already exist with image_path in DB
+        ids_to_check = [f"{self.uid}:{cid}:{m.id}" for cid, m, _ in final_items]
+        existing_map = {}
+        if ids_to_check:
+            db_res = await run(lambda: sb.table("products").select("*")
+                               .in_("id", ids_to_check).execute())
+            for r in (db_res.data or []):
+                existing_map[r["id"]] = r
+
+        results = []
+        to_upsert = []
+
+        async def process_one(cid, m, pm):
+            pid = f"{self.uid}:{cid}:{m.id}"
+            ex = existing_map.get(pid)
+            if ex and ex.get("image_path"):
+                return ex
+            row = self._row(cid, m.id, m.date, m.message or "")
+            if pm is not None:
+                rich = await self.enrich(cid, m.id, row, pm)
+                if rich:
+                    to_upsert.append(rich)
+                    return rich
+            to_upsert.append(row)
+            return row
+
+        results = await asyncio.gather(*[process_one(cid, m, pm) for cid, m, pm in final_items])
+        if to_upsert:
+            await self.upsert(to_upsert)
+        return list(results)
+
     async def backfill(self, chat_id: int):
-        """Sync the entire channel history (no 90-day cutoff) + retry missing photos."""
         msgs = []
         try:
-            async for m in self.client.iter_messages(chat_id, limit=MAX_MSGS, wait_time=0.4):
+            async for m in self.client.iter_messages(chat_id, limit=MAX_MSGS, wait_time=0.3):
                 if self.stopped or chat_id not in self.enabled:
                     return
                 if getattr(m, "action", None):
@@ -389,7 +496,7 @@ class Worker:
             else:
                 singles.append(m)
 
-        items = []  # (msg_id, date, text, photo_msg)
+        items = []
         for m in singles:
             items.append((m.id, m.date, m.message or "", m if has_visual(m) else None))
         for g in groups.values():
@@ -402,7 +509,6 @@ class Worker:
         rows = [self._row(chat_id, mid, dt, txt) for mid, dt, txt, _ in items]
         await self.upsert(rows)
 
-        # Fetch all message_ids that ALREADY have an image_path saved
         done = set()
         offset = 0
         while True:
@@ -418,10 +524,6 @@ class Worker:
             offset += 1000
 
         todo = [(mid, row, pm) for (mid, _, _, pm), row in zip(items, rows) if pm is not None and mid not in done]
-        log.info("[%s] channel %s: %d total products, downloading %d photos...", self.uid[:8], chat_id, len(rows), len(todo))
-
-        # Process photos in small batches of 15 and save immediately so progress is never lost
-        photos_saved = 0
         for i in range(0, len(todo), 15):
             if self.stopped or chat_id not in self.enabled:
                 return
@@ -430,16 +532,14 @@ class Worker:
             valid = [r for r in enriched if r]
             if valid:
                 await self.upsert(valid)
-                photos_saved += len(valid)
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(0.2)
 
         await run(lambda: sb.table("user_channels")
                   .update({"last_synced_at": datetime.now(timezone.utc).isoformat()})
                   .eq("user_id", self.uid).eq("channel_id", chat_id).execute())
-        log.info("[%s] finished %s: %d products, %d new photos", self.uid[:8], chat_id, len(rows), photos_saved)
+        log.info("[%s] synced %s: %d products", self.uid[:8], chat_id, len(rows))
 
     async def enrich(self, chat_id: int, msg_id: int, row: dict, photo_msg) -> Optional[dict]:
-        """Download photo or video thumbnail with retries and upload to Supabase Storage."""
         async with MEDIA_SEM:
             for attempt in range(3):
                 try:
@@ -454,14 +554,13 @@ class Worker:
                         if not data:
                             data = await self.client.download_media(photo_msg, file=bytes)
                     else:
-                        # Video or Document thumbnail
                         try:
                             data = await self.client.download_media(photo_msg, file=bytes, thumb=-1)
                         except Exception:
                             data = await self.client.download_media(photo_msg, file=bytes, thumb=0)
 
                     if not data:
-                        await asyncio.sleep(1)
+                        await asyncio.sleep(0.8)
                         continue
 
                     jpeg, h = await asyncio.to_thread(make_thumb, data)
@@ -473,7 +572,7 @@ class Worker:
                     await asyncio.sleep(min(e.seconds + 1, 120))
                 except Exception as e:
                     log.warning("[%s] photo %s/%s attempt %d failed: %s", self.uid[:8], chat_id, msg_id, attempt + 1, type(e).__name__)
-                    await asyncio.sleep(1.5 * (attempt + 1))
+                    await asyncio.sleep(1.0 * (attempt + 1))
             return None
 
     def _register_handlers(self):
@@ -586,7 +685,6 @@ async def lifespan(app: FastAPI):
             for row in res.data or []:
                 s = dec(row.get("session_string") or "")
                 if not s:
-                    log.warning("[%s] cannot decrypt session (wrong SESSION_ENC_KEY?)", row["user_id"][:8])
                     continue
                 await start_worker(row["user_id"], s)
                 await asyncio.sleep(2)
@@ -655,10 +753,29 @@ class DisconnectIn(BaseModel):
     purge: bool = True
 
 
+class LiveSearchIn(BaseModel):
+    query: str = Field(min_length=1, max_length=120)
+    channel_id: Optional[int] = None
+
+
 @app.get("/health")
 @app.get("/")
 async def health():
     return {"ok": True, "status": "OK"}
+
+
+@app.post("/live-search")
+async def live_search(body: LiveSearchIn, uid: str = Depends(current_user)):
+    limiter.check(f"search:{uid}", 30, 60)
+    w = await get_worker(uid)
+    if not w:
+        raise HTTPException(400, "Pehla Telegram connect karo.")
+    for _ in range(20):
+        if w.alive:
+            break
+        await asyncio.sleep(0.3)
+    products = await w.live_search(body.query.strip(), body.channel_id)
+    return {"ok": True, "products": products}
 
 
 @app.post("/send-otp")
