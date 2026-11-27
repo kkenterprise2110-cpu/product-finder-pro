@@ -96,7 +96,7 @@ export default function Dashboard({ session }) {
     for (const item of list.items) map.set(item.id, item);
     for (const item of liveRows) {
       const ex = map.get(item.id);
-      if (!ex || (!ex.image_path && item.image_path)) {
+      if (!ex || (!ex.image_path && !ex.live_image && (item.live_image || item.image_path))) {
         map.set(item.id, item);
       }
     }
@@ -125,7 +125,7 @@ export default function Dashboard({ session }) {
 
   const items = photo ? photoItems : mergedSearchItems;
   const loading = photo ? photo.loading : (list.loading && items.length === 0 && !liveSearching);
-  const urlFor = useSignedUrls(items.map((i) => i.image_path).filter(Boolean));
+  const urlFor = useSignedUrls(items.filter((i) => !i.live_image && i.image_path).map((i) => i.image_path));
 
   const bestId = useMemo(() => {
     if (items.length < 2 || !(photo || dq.trim())) return null;
@@ -284,7 +284,7 @@ export default function Dashboard({ session }) {
             </div>
             <div className="grid">
               {items.map((p) => (
-                <ProductCard key={p.id} p={p} imageUrl={urlFor(p.image_path)} best={p.id === bestId}
+                <ProductCard key={p.id} p={p} imageUrl={p.live_image || urlFor(p.image_path)} best={p.id === bestId}
                   similarity={photo && p.distance != null ? Math.round((1 - p.distance / 64) * 100) : null} />
               ))}
             </div>
