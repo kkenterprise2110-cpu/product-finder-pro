@@ -9,13 +9,18 @@ export class ApiError extends Error {
   }
 }
 
-async function request(path, { method = 'GET', body, timeout = 60000 } = {}) {
+async function request(path, { method = 'GET', body, timeout = 60000, signal: extSignal } = {}) {
   const { data } = await supabase.auth.getSession();
   const token = data?.session?.access_token;
   if (!token) throw new ApiError('Login expire thai gayu. Fari login karo.', 401);
 
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeout);
+  if (extSignal) {
+    if (extSignal.aborted) ctrl.abort();
+    else extSignal.addEventListener('abort', () => ctrl.abort(), { once: true });
+  }
+
   try {
     const res = await fetch(`${BASE}${path}`, {
       method,
@@ -28,6 +33,7 @@ async function request(path, { method = 'GET', body, timeout = 60000 } = {}) {
     if (!res.ok || json?.ok === false) throw new ApiError(json?.error || `Server error (${res.status})`, res.status);
     return json;
   } catch (e) {
+    if (e.name === 'AbortError') throw e;
     if (e instanceof ApiError) throw e;
     throw new ApiError('Server jagi rahyo che (free server). 20-40 second pachi fari try karo.', 0);
   } finally {
@@ -40,7 +46,7 @@ async function withWake(path, opts) {
   try {
     return await request(path, opts);
   } catch (e) {
-    if (e.status !== 0) throw e;
+    if (e.name === 'AbortError' || e.status !== 0) throw e;
     await new Promise((r) => setTimeout(r, 4000));
     return request(path, opts);
   }
@@ -54,5 +60,7 @@ export const api = {
   refreshChannels: () => withWake('/channels/refresh', { method: 'POST' }),
   toggleChannels: (channel_ids, enabled) => withWake('/channels/toggle', { method: 'POST', body: { channel_ids, enabled } }),
   disconnect: (purge) => withWake('/disconnect', { method: 'POST', body: { purge } }),
+  liveSearch: (query, channel_id = null, signal = null) =>
+    request('/live-search', { method: 'POST', body: { query, channel_id }, timeout: 25000, signal }),
   wake: () => fetch(`${BASE}/health`, { cache: 'no-store' }).catch(() => {}),
 };
