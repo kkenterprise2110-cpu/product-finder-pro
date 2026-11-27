@@ -1,32 +1,37 @@
-﻿import { useState, useEffect } from 'react';
-import { supabase } from './lib/supabase';
-import Login from './pages/Login';
-import Dashboard from './pages/Dashboard';
+import { Component, useEffect, useState } from 'react';
+import { Loader2 } from 'lucide-react';
+import { configMissing, supabase } from './lib/supabase';
+import AuthScreen from './components/AuthScreen.jsx';
+import Dashboard from './components/Dashboard.jsx';
 
-export default function App() {
-  const [session, setSession] = useState(null);
-  const [loading, setLoading] = useState(true);
-
-  useEffect(() => {
-    supabase.auth.getSession().then(({ data: { session } }) => {
-      setSession(session);
-      setLoading(false);
-    });
-
-    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
-      setSession(session);
-    });
-
-    return () => subscription.unsubscribe();
-  }, []);
-
-  if (loading) {
+class Boundary extends Component {
+  state = { err: false };
+  static getDerivedStateFromError() { return { err: true }; }
+  render() {
+    if (!this.state.err) return this.props.children;
     return (
-      <div className="min-h-screen flex items-center justify-center bg-slate-950 text-white">
-        <div className="animate-pulse text-lg font-semibold">Loading Product Finder Pro...</div>
+      <div className="splash">
+        <div className="center">
+          <h2>Kai gadbad thai</h2>
+          <button className="btn primary" onClick={() => location.reload()}>Reload</button>
+        </div>
       </div>
     );
   }
+}
 
-  return session ? <Dashboard /> : <Login />;
+export default function App() {
+  const [session, setSession] = useState(undefined); // undefined = still checking
+
+  useEffect(() => {
+    if (configMissing) { setSession(null); return; }
+    supabase.auth.getSession().then(({ data }) => setSession(data.session ?? null));
+    const { data: sub } = supabase.auth.onAuthStateChange((_e, s) => setSession(s ?? null));
+    return () => sub.subscription.unsubscribe();
+  }, []);
+
+  if (session === undefined) {
+    return <div className="splash"><Loader2 className="spin" size={28} /></div>;
+  }
+  return <Boundary>{session ? <Dashboard session={session} /> : <AuthScreen />}</Boundary>;
 }

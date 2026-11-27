@@ -1,39 +1,56 @@
-﻿export async function computeImageHash(file) {
-  return new Promise((resolve) => {
-    const img = new Image();
-    img.onload = () => {
-      const canvas = document.createElement('canvas');
-      canvas.width = 8;
-      canvas.height = 8;
-      const ctx = canvas.getContext('2d');
-      ctx.drawImage(img, 0, 0, 8, 8);
-      const data = ctx.getImageData(0, 0, 8, 8).data;
+// 64-bit difference hash. Must stay in sync with dhash64() in Backend/sync.py:
+// area-average the image to 9x8 grey cells, bit = left cell brighter than right cell.
 
-      let grays = [];
-      let sum = 0;
-      for (let i = 0; i < data.length; i += 4) {
-        const gray = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
-        grays.push(gray);
-        sum += gray;
-      }
-      const avg = sum / 64;
-      let bits = grays.map((g) => (g >= avg ? '1' : '0')).join('');
-      let hex = '';
-      for (let i = 0; i < 64; i += 4) {
-        hex += parseInt(bits.slice(i, i + 4), 2).toString(16);
-      }
-      resolve(hex);
-    };
-    img.src = URL.createObjectURL(file);
-  });
+async function loadBitmap(file) {
+  if (window.createImageBitmap) {
+    try { return await createImageBitmap(file, { imageOrientation: 'from-image' }); } catch { /* fall through */ }
+  }
+  const url = URL.createObjectURL(file);
+  try {
+    const img = new Image();
+    img.src = url;
+    await img.decode();
+    return img;
+  } finally {
+    URL.revokeObjectURL(url);
+  }
 }
 
-export function hammingDistance(h1, h2) {
-  if (!h1 || !h2 || h1.length !== h2.length) return 999;
-  let dist = 0;
-  for (let i = 0; i < h1.length; i++) {
-    const xor = parseInt(h1[i], 16) ^ parseInt(h2[i], 16);
-    dist += xor.toString(2).split('1').length - 1;
+export async function dhashFromFile(file) {
+  if (!file.type.startsWith('image/')) throw new Error('Fakt image file select karo.');
+  if (file.size > 15 * 1024 * 1024) throw new Error('Image 15MB thi nani joye.');
+  const bmp = await loadBitmap(file);
+  const w0 = bmp.width, h0 = bmp.height;
+  const scale = Math.min(1, 288 / Math.max(w0, h0));
+  const W = Math.max(9, Math.round(w0 * scale));
+  const H = Math.max(8, Math.round(h0 * scale));
+  const canvas = document.createElement('canvas');
+  canvas.width = W; canvas.height = H;
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  ctx.imageSmoothingQuality = 'high';
+  ctx.drawImage(bmp, 0, 0, W, H);
+  const { data } = ctx.getImageData(0, 0, W, H);
+
+  const grey = new Float64Array(9 * 8);
+  for (let r = 0; r < 8; r++) {
+    for (let c = 0; c < 9; c++) {
+      const x0 = Math.floor((c * W) / 9), x1 = Math.max(x0 + 1, Math.floor(((c + 1) * W) / 9));
+      const y0 = Math.floor((r * H) / 8), y1 = Math.max(y0 + 1, Math.floor(((r + 1) * H) / 8));
+      let sum = 0, n = 0;
+      for (let y = y0; y < y1; y++) {
+        for (let x = x0; x < x1; x++) {
+          const i = (y * W + x) * 4;
+          sum += 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+          n++;
+        }
+      }
+      grey[r * 9 + c] = sum / n;
+    }
   }
-  return dist;
+  let bits = 0n;
+  for (let r = 0; r < 8; r++) for (let c = 0; c < 8; c++) {
+    bits = (bits << 1n) | (grey[r * 9 + c] > grey[r * 9 + c + 1] ? 1n : 0n);
+  }
+  if (bmp.close) bmp.close();
+  return BigInt.asIntN(64, bits).toString(); // signed -> Postgres bigint
 }
