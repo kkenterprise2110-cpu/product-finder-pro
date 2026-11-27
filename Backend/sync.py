@@ -1,11 +1,11 @@
-"""Product Finder Pro - backend (FastAPI + Telethon).
+﻿"""Product Finder Pro - backend (FastAPI + Telethon).
 
 Security model
-  * Every endpoint (except /health) needs a valid Supabase login token. The
+- Every endpoint (except /health) needs a valid Supabase login token. The
     user id comes from the verified token, never from the request body.
-  * Telegram session strings are encrypted (Fernet) before they touch the DB.
-  * Telegram is used READ-ONLY: we never send/forward/delete anything.
-  * CORS is limited to ALLOWED_ORIGINS; OTP / login endpoints are rate limited.
+- Telegram session strings are encrypted (Fernet) before they touch the DB.
+- Telegram is used READ-ONLY: we never send/forward/delete anything.
+- CORS is limited to ALLOWED_ORIGINS; OTP / login endpoints are rate limited.
 """
 import asyncio
 import io
@@ -132,6 +132,14 @@ def make_thumb(data: bytes):
     out = io.BytesIO()
     img.save(out, "JPEG", quality=72, optimize=True)
     return out.getvalue(), h
+
+
+def has_visual(m) -> bool:
+    """Return True if message has a photo or a video with a thumbnail."""
+    if getattr(m, "photo", None):
+        return True
+    vid = getattr(m, "video", None)
+    return bool(vid and getattr(vid, "thumbs", None))
 
 
 def pick_size(photo):
@@ -394,18 +402,18 @@ class Worker:
                 singles.append(m)
         items = []  # (msg_id, date, text, photo_msg)
         for m in singles:
-            items.append((m.id, m.date, m.message or "", m if m.photo else None))
+            items.append((m.id, m.date, m.message or "", m if has_visual(m) else None))
         for g in groups.values():
             first = min(g, key=lambda x: x.id)
             text = next((x.message for x in g if x.message), "")
-            photo_msg = next((x for x in sorted(g, key=lambda x: x.id) if x.photo), None)
+            photo_msg = next((x for x in sorted(g, key=lambda x: x.id) if has_visual(x)), None)
             items.append((first.id, first.date, text, photo_msg))
         items = [i for i in items if i[2].strip() or i[3]]
 
         rows = [self._row(chat_id, mid, dt, txt) for mid, dt, txt, _ in items]
         await self.upsert(rows)  # text first => results are searchable immediately
 
-        # photos next (skip the ones we already processed on an earlier run)
+        # photos & video thumbnails next (skip the ones we already processed on an earlier run)
         have = await run(lambda: sb.table("products").select("message_id")
                          .eq("user_id", self.uid).eq("channel_id", chat_id)
                          .not_.is_("image_path", "null").limit(2000).execute())
@@ -423,11 +431,15 @@ class Worker:
         """Download a small preview, store it privately and compute the image hash."""
         async with MEDIA_SEM:
             try:
-                size = pick_size(photo_msg.photo)
-                try:
-                    data = await self.client.download_media(photo_msg, file=bytes, thumb=size)
-                except Exception:
-                    data = await self.client.download_media(photo_msg, file=bytes)
+                if getattr(photo_msg, "photo", None):
+                    size = pick_size(photo_msg.photo)
+                    try:
+                        data = await self.client.download_media(photo_msg, file=bytes, thumb=size)
+                    except Exception:
+                        data = await self.client.download_media(photo_msg, file=bytes)
+                else:
+                    # Video thumbnail preview
+                    data = await self.client.download_media(photo_msg, file=bytes, thumb=-1)
                 if not data:
                     return None
                 jpeg, h = await asyncio.to_thread(make_thumb, data)
@@ -449,7 +461,7 @@ class Worker:
             if chat_id not in self.enabled:
                 return
             text = msg.message if text is None else text
-            pm = photo_msg if photo_msg is not None else (msg if msg.photo else None)
+            pm = photo_msg if photo_msg is not None else (msg if has_visual(msg) else None)
             if not (text or "").strip() and not pm:
                 return
             mid = first_id or msg.id
@@ -470,7 +482,7 @@ class Worker:
             if not ev.is_channel:
                 return
             msgs = sorted(ev.messages, key=lambda x: x.id)
-            pm = next((x for x in msgs if x.photo), None)
+            pm = next((x for x in msgs if has_visual(x)), None)
             await handle_one(ev.chat_id, msgs[0], text=ev.text or "", photo_msg=pm, first_id=msgs[0].id)
 
         @c.on(events.MessageEdited())
