@@ -4,7 +4,7 @@ import {
 } from 'lucide-react';
 import { supabase } from '../lib/supabase';
 import { api } from '../lib/api';
-import { dhashFromFile } from '../lib/imageHash';
+import { dualDhashFromFile } from '../lib/imageHash';
 import useDebounce from '../hooks/useDebounce';
 import useProducts from '../hooks/useProducts';
 import useSignedUrls from '../hooks/useSignedUrls';
@@ -12,17 +12,30 @@ import ProductCard, { CardSkeleton } from './ProductCard.jsx';
 import TelegramConnect from './TelegramConnect.jsx';
 import ChannelsModal from './ChannelsModal.jsx';
 
+function extractCoreKeywords(title) {
+  if (!title) return '';
+  const cleaned = title
+    .replace(/[^\w\s-]/g, ' ')
+    .replace(/\b(black|white|blue|red|green|yellow|pink|beige|cream|grey|gray|brown|multicolor|pack|pcs|set|rs|inr|price|stock|available|best|quality|new|portable|with|for)\b/gi, ' ')
+    .replace(/\b\d+\b/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const words = cleaned.split(' ').filter((w) => w.length > 2);
+  return words.slice(0, 2).join(' ');
+}
+
 export default function Dashboard({ session }) {
   const uid = session.user.id;
   const [q, setQ] = useState('');
   const [hideOut, setHideOut] = useState(false);
-  const [sort, setSort] = useState('price_asc');
+  const [sort, setSort] = useState('new'); // Default: Latest to Old
   const [photoSort, setPhotoSort] = useState('match');
   const [channelId, setChannelId] = useState('');
-  const [photo, setPhoto] = useState(null); // { preview, rows, loading }
+  const [photo, setPhoto] = useState(null);
   const [liveRows, setLiveRows] = useState([]);
   const [liveSearching, setLiveSearching] = useState(false);
-  const [modal, setModal] = useState(null); // 'tg' | 'channels'
+  const [totalDbCount, setTotalDbCount] = useState(null);
+  const [modal, setModal] = useState(null);
   const [status, setStatus] = useState(null);
   const [statusErr, setStatusErr] = useState('');
   const [channels, setChannels] = useState([]);
@@ -49,14 +62,21 @@ export default function Dashboard({ session }) {
     const { data } = await supabase.from('user_channels').select('channel_id,title').eq('enabled', true).order('title');
     setChannels(data || []);
   }, []);
+  const loadTotalCount = useCallback(async () => {
+    const { count } = await supabase.from('products').select('id', { count: 'exact', head: true });
+    if (typeof count === 'number') setTotalDbCount(count);
+  }, []);
 
   useEffect(() => { api.wake(); loadStatus(); }, [loadStatus]);
-  useEffect(() => { loadChannels(); }, [loadChannels, version]);
+  useEffect(() => { loadChannels(); loadTotalCount(); }, [loadChannels, loadTotalCount, version]);
 
   // ---------------------------------------------------------------- live "new products"
   useEffect(() => {
     const ch = supabase.channel('products-live')
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'products', filter: `user_id=eq.${uid}` }, () => setFresh((n) => n + 1))
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'products', filter: `user_id=eq.${uid}` }, () => {
+        setFresh((n) => n + 1);
+        setTotalDbCount((c) => (typeof c === 'number' ? c + 1 : c));
+      })
       .subscribe();
     return () => { supabase.removeChannel(ch); };
   }, [uid]);
@@ -89,7 +109,7 @@ export default function Dashboard({ session }) {
     return () => ac.abort();
   }, [dq, channelId, photo, status?.status]);
 
-  // Merge DB items + Live Telegram search results without duplicates
+  // Merge DB items + Live Telegram search results (default Latest to Old)
   const mergedSearchItems = useMemo(() => {
     if (!dq.trim()) return list.items;
     const map = new Map();
@@ -104,21 +124,22 @@ export default function Dashboard({ session }) {
     if (hideOut) arr = arr.filter((x) => x.status === 'IN_STOCK');
     if (channelId) arr = arr.filter((x) => x.channel_id === Number(channelId));
     const by = {
+      new: (a, b) => new Date(b.posted_at) - new Date(a.posted_at),
       price_asc: (a, b) => (a.price ?? Infinity) - (b.price ?? Infinity),
       price_desc: (a, b) => (b.price ?? -Infinity) - (a.price ?? -Infinity),
-      new: (a, b) => new Date(b.posted_at) - new Date(a.posted_at),
     }[sort];
     return by ? [...arr].sort(by) : arr;
   }, [dq, list.items, liveRows, hideOut, channelId, sort]);
 
+  // Photo search: First exact color (Black), then mirrored & other colors (White, Beige, Blue)
   const photoItems = useMemo(() => {
     if (!photo?.rows) return [];
     let r = photo.rows.filter((x) => !hideOut || x.status === 'IN_STOCK').filter((x) => !channelId || x.channel_id === Number(channelId));
     const by = {
+      match: (a, b) => ((a.distance ?? 26) - (b.distance ?? 26)) || (new Date(b.posted_at) - new Date(a.posted_at)),
+      new: (a, b) => new Date(b.posted_at) - new Date(a.posted_at),
       price_asc: (a, b) => (a.price ?? Infinity) - (b.price ?? Infinity),
       price_desc: (a, b) => (b.price ?? -Infinity) - (a.price ?? -Infinity),
-      new: (a, b) => new Date(b.posted_at) - new Date(a.posted_at),
-      match: (a, b) => a.distance - b.distance,
     }[photoSort];
     return [...r].sort(by);
   }, [photo, hideOut, photoSort, channelId]);
@@ -142,19 +163,67 @@ export default function Dashboard({ session }) {
     return () => io.disconnect();
   }, [photo, list.loadMore, list.items.length]);
 
-  // ---------------------------------------------------------------- photo search
+  // ---------------------------------------------------------------- Smart Photo Search
   const onPhoto = async (e) => {
     const file = e.target.files?.[0];
     e.target.value = '';
     if (!file) return;
     const preview = URL.createObjectURL(file);
     setPhoto({ preview, rows: null, loading: true });
+    setPhotoSort('match');
     try {
-      const hash = await dhashFromFile(file);
-      const { data, error } = await supabase.rpc('search_by_image', { q_hash: hash, max_distance: 14, lim: 60 });
-      if (error) throw error;
-      setPhoto({ preview, rows: data || [], loading: false });
-      if (!data?.length) toast('Aa photo jevu koi product malyu nahi.');
+      const { normal, flipped } = await dualDhashFromFile(file);
+
+      const [resNormal, resFlipped] = await Promise.all([
+        supabase.rpc('search_by_image', { q_hash: normal, max_distance: 24, lim: 80 }),
+        supabase.rpc('search_by_image', { q_hash: flipped, max_distance: 24, lim: 80 }),
+      ]);
+      if (resNormal.error) throw resNormal.error;
+
+      const mergedMap = new Map();
+      for (const row of (resNormal.data || [])) {
+        mergedMap.set(row.id, { ...row, distance: row.distance ?? 10 });
+      }
+      for (const row of (resFlipped.data || [])) {
+        const d = (row.distance ?? 12) + 2;
+        const ex = mergedMap.get(row.id);
+        if (!ex || d < ex.distance) {
+          mergedMap.set(row.id, { ...row, distance: d });
+        }
+      }
+
+      let combined = Array.from(mergedMap.values()).sort(
+        (a, b) => (a.distance - b.distance) || (new Date(b.posted_at) - new Date(a.posted_at))
+      );
+
+      // Fetch all color variants (White, Blue, Beige, etc.) from DB + Live Telegram using matched title
+      if (combined.length > 0) {
+        const keywords = extractCoreKeywords(combined[0].product_name);
+        if (keywords.length >= 3) {
+          try {
+            const [dbMore, liveRes] = await Promise.all([
+              supabase.from('products')
+                .select('id,channel_id,channel_name,product_name,raw_text,price,status,telegram_link,image_path,posted_at')
+                .ilike('search_text', `%${keywords.split(' ')[0]}%`)
+                .limit(60),
+              status?.status === 'CONNECTED' ? api.liveSearch(keywords) : Promise.resolve({ products: [] }),
+            ]);
+            for (const item of [...(dbMore.data || []), ...(liveRes.products || [])]) {
+              if (!mergedMap.has(item.id)) {
+                mergedMap.set(item.id, { ...item, distance: 26 });
+              }
+            }
+            combined = Array.from(mergedMap.values()).sort(
+              (a, b) => (a.distance - b.distance) || (new Date(b.posted_at) - new Date(a.posted_at))
+            );
+          } catch {
+            // keep visual matches
+          }
+        }
+      }
+
+      setPhoto({ preview, rows: combined, loading: false });
+      if (!combined.length) toast('Aa photo jevu koi product malyu nahi.');
     } catch (err) {
       setPhoto(null);
       toast(err.message || 'Photo search na thayu.', true);
@@ -173,6 +242,13 @@ export default function Dashboard({ session }) {
     : { cls: 'idle', text: 'Not connected' };
 
   const noFilters = !dq.trim() && !hideOut && !channelId && !photo;
+  const boxTotalLabel = photo
+    ? `${photoItems.length} matched`
+    : dq.trim()
+      ? `${items.length} found`
+      : totalDbCount != null
+        ? `${totalDbCount} total`
+        : `${items.length}${list.hasMore ? '+' : ''}`;
 
   return (
     <>
@@ -194,8 +270,29 @@ export default function Dashboard({ session }) {
             <div className="search-row">
               <div className="search-box">
                 <Search size={18} />
-                <input type="search" value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search any product live across all channels…" aria-label="Search products" disabled={!!photo} />
+                <input
+                  type="search"
+                  value={q}
+                  onChange={(e) => setQ(e.target.value)}
+                  placeholder="Search any product live across all channels…"
+                  aria-label="Search products"
+                  disabled={!!photo}
+                />
                 {liveSearching && <Loader2 size={16} className="spin" />}
+                <span
+                  style={{
+                    fontSize: '12px',
+                    fontWeight: 600,
+                    padding: '3px 9px',
+                    borderRadius: '999px',
+                    background: '#eff6ff',
+                    color: '#1d4ed8',
+                    whiteSpace: 'nowrap',
+                    flexShrink: 0,
+                  }}
+                >
+                  {boxTotalLabel}
+                </span>
                 {q && !photo && <button className="icon-btn clear" onClick={() => setQ('')} aria-label="Clear"><X size={16} /></button>}
               </div>
               <button className="btn primary" onClick={() => fileRef.current?.click()} disabled={photo?.loading}>
@@ -207,7 +304,11 @@ export default function Dashboard({ session }) {
             {photo && (
               <div className="photo-chip">
                 <img src={photo.preview} alt="" />
-                <span style={{ flex: 1 }}>{photo.loading ? 'Photo match thai rahyu che…' : `${photoItems.length} similar product${photoItems.length === 1 ? '' : 's'}`}</span>
+                <span style={{ flex: 1 }}>
+                  {photo.loading
+                    ? 'Photo match & all color variants searching…'
+                    : `${photoItems.length} product${photoItems.length === 1 ? '' : 's'} (Same color first, White/Blue/other colors after)`}
+                </span>
                 <button className="btn sm" onClick={clearPhoto}><X size={14} />Clear</button>
               </div>
             )}
@@ -223,10 +324,10 @@ export default function Dashboard({ session }) {
               <div className="push">
                 <label htmlFor="sort" className="muted hide-sm">Sort by</label>
                 <select id="sort" className="select" value={photo ? photoSort : sort} onChange={(e) => (photo ? setPhotoSort(e.target.value) : setSort(e.target.value))}>
-                  {photo && <option value="match">Best match</option>}
+                  {photo && <option value="match">Photo Match (Exact → All Colors)</option>}
+                  <option value="new">Latest to Old</option>
                   <option value="price_asc">Price: Low to High</option>
                   <option value="price_desc">Price: High to Low</option>
-                  <option value="new">Newest first</option>
                 </select>
               </div>
             </div>
@@ -285,7 +386,7 @@ export default function Dashboard({ session }) {
             <div className="grid">
               {items.map((p) => (
                 <ProductCard key={p.id} p={p} imageUrl={p.live_image || urlFor(p.image_path)} best={p.id === bestId}
-                  similarity={photo && p.distance != null ? Math.round((1 - p.distance / 64) * 100) : null} />
+                  similarity={photo && p.distance != null ? Math.max(50, Math.round((1 - p.distance / 64) * 100)) : null} />
               ))}
             </div>
             {!photo && <div ref={sentinel} className="sentinel" />}

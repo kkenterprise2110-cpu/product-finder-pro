@@ -3,12 +3,10 @@ import { supabase } from '../lib/supabase';
 import { tokenize } from '../lib/format';
 
 const PAGE = 36;
-const DAYS = 90;
 const COLS = 'id,channel_id,channel_name,product_name,raw_text,price,status,telegram_link,image_path,posted_at';
 
 function build({ q, hideOut, sort, channelId }) {
   let qb = supabase.from('products').select(COLS);
-  qb = qb.gte('posted_at', new Date(Date.now() - DAYS * 864e5).toISOString());
   for (const t of tokenize(q)) qb = qb.ilike('search_text', `%${t}%`);
   if (hideOut) qb = qb.eq('status', 'IN_STOCK');
   if (channelId) qb = qb.eq('channel_id', channelId);
@@ -27,7 +25,7 @@ export default function useProducts(filters, version) {
     const id = ++req.current;
     setState((s) => (offset === 0 ? { ...s, loading: true, error: '' } : { ...s, more: true }));
     const { data, error } = await build(filters).range(offset, offset + PAGE - 1);
-    if (id !== req.current) return; // a newer search started
+    if (id !== req.current) return;
     if (error) return setState((s) => ({ ...s, loading: false, more: false, error: 'Products load na thaya. Fari try karo.' }));
     setState((s) => ({
       items: offset === 0 ? data : [...s.items, ...data],
