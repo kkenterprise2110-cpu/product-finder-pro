@@ -12,16 +12,23 @@ import ProductCard, { CardSkeleton } from './ProductCard.jsx';
 import TelegramConnect from './TelegramConnect.jsx';
 import ChannelsModal from './ChannelsModal.jsx';
 
-function extractCoreKeywords(title) {
-  if (!title) return '';
-  const cleaned = title
-    .replace(/[^\w\s-]/g, ' ')
-    .replace(/\b(black|white|blue|red|green|yellow|pink|beige|cream|grey|gray|brown|multicolor|pack|pcs|set|rs|inr|price|stock|available|best|quality|new|portable|with|for)\b/gi, ' ')
-    .replace(/\b\d+\b/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-  const words = cleaned.split(' ').filter((w) => w.length > 2);
-  return words.slice(0, 2).join(' ');
+// Extract strict core product words (e.g. ["folding", "stool"]) so ONLY the exact same product model matches
+function extractStrictModelTerms(title) {
+  if (!title) return [];
+  const stop = new Set([
+    'black', 'white', 'blue', 'red', 'green', 'yellow', 'pink', 'beige', 'cream',
+    'grey', 'gray', 'brown', 'orange', 'purple', 'multicolor', 'color', 'colour', 'mix',
+    'pack', 'pcs', 'piece', 'pieces', 'set', 'rs', 'inr', 'price', 'rate', 'only',
+    'stock', 'available', 'best', 'quality', 'new', 'for', 'with', 'and', 'the',
+    'outdoor', 'indoor', 'home', 'use', 'heavy', 'duty', 'mini', 'large', 'small',
+    'portable', 'chair', 'box', 'case', 'cover', 'holder', 'stand', 'bag', 'kit',
+  ]);
+  const words = title
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .split(/\s+/)
+    .filter((w) => w.length >= 3 && !stop.has(w) && !/^\d+$/.test(w));
+  return [...new Set(words)].slice(0, 2);
 }
 
 export default function Dashboard({ session }) {
@@ -131,12 +138,12 @@ export default function Dashboard({ session }) {
     return by ? [...arr].sort(by) : arr;
   }, [dq, list.items, liveRows, hideOut, channelId, sort]);
 
-  // Photo search: First exact color (Black), then mirrored & other colors (White, Beige, Blue)
+  // Photo search: ONLY exact same product (same color first -> white/beige/blue variants after, NO unrelated items)
   const photoItems = useMemo(() => {
     if (!photo?.rows) return [];
     let r = photo.rows.filter((x) => !hideOut || x.status === 'IN_STOCK').filter((x) => !channelId || x.channel_id === Number(channelId));
     const by = {
-      match: (a, b) => ((a.distance ?? 26) - (b.distance ?? 26)) || (new Date(b.posted_at) - new Date(a.posted_at)),
+      match: (a, b) => ((a.distance ?? 15) - (b.distance ?? 15)) || (new Date(b.posted_at) - new Date(a.posted_at)),
       new: (a, b) => new Date(b.posted_at) - new Date(a.posted_at),
       price_asc: (a, b) => (a.price ?? Infinity) - (b.price ?? Infinity),
       price_desc: (a, b) => (b.price ?? -Infinity) - (a.price ?? -Infinity),
@@ -163,7 +170,7 @@ export default function Dashboard({ session }) {
     return () => io.disconnect();
   }, [photo, list.loadMore, list.items.length]);
 
-  // ---------------------------------------------------------------- Smart Photo Search
+  // ---------------------------------------------------------------- Strict Same-Product Photo Search
   const onPhoto = async (e) => {
     const file = e.target.files?.[0];
     e.target.value = '';
@@ -174,21 +181,28 @@ export default function Dashboard({ session }) {
     try {
       const { normal, flipped } = await dualDhashFromFile(file);
 
+      // Strict distance <= 12 (81%+ match) blocks all unrelated toys/juicers/sponges
       const [resNormal, resFlipped] = await Promise.all([
-        supabase.rpc('search_by_image', { q_hash: normal, max_distance: 24, lim: 80 }),
-        supabase.rpc('search_by_image', { q_hash: flipped, max_distance: 24, lim: 80 }),
+        supabase.rpc('search_by_image', { q_hash: normal, max_distance: 12, lim: 50 }),
+        supabase.rpc('search_by_image', { q_hash: flipped, max_distance: 12, lim: 50 }),
       ]);
       if (resNormal.error) throw resNormal.error;
 
       const mergedMap = new Map();
+      // Tier 1: Exact same photo & color first (distance 0..12)
       for (const row of (resNormal.data || [])) {
-        mergedMap.set(row.id, { ...row, distance: row.distance ?? 10 });
+        if ((row.distance ?? 15) <= 12) {
+          mergedMap.set(row.id, { ...row, distance: row.distance ?? 4 });
+        }
       }
+      // Tier 2: Mirrored/flipped & different colors of the exact same shape right after
       for (const row of (resFlipped.data || [])) {
-        const d = (row.distance ?? 12) + 2;
-        const ex = mergedMap.get(row.id);
-        if (!ex || d < ex.distance) {
-          mergedMap.set(row.id, { ...row, distance: d });
+        if ((row.distance ?? 15) <= 12) {
+          const d = (row.distance ?? 6) + 3;
+          const ex = mergedMap.get(row.id);
+          if (!ex || d < ex.distance) {
+            mergedMap.set(row.id, { ...row, distance: d });
+          }
         }
       }
 
@@ -196,21 +210,28 @@ export default function Dashboard({ session }) {
         (a, b) => (a.distance - b.distance) || (new Date(b.posted_at) - new Date(a.posted_at))
       );
 
-      // Fetch all color variants (White, Blue, Beige, etc.) from DB + Live Telegram using matched title
+      // Tier 3: Other color variants of THIS EXACT model (e.g. White/Beige/Blue Folding Stool)
       if (combined.length > 0) {
-        const keywords = extractCoreKeywords(combined[0].product_name);
-        if (keywords.length >= 3) {
+        const terms = extractStrictModelTerms(combined[0].product_name);
+        if (terms.length >= 2) {
           try {
-            const [dbMore, liveRes] = await Promise.all([
-              supabase.from('products')
-                .select('id,channel_id,channel_name,product_name,raw_text,price,status,telegram_link,image_path,posted_at')
-                .ilike('search_text', `%${keywords.split(' ')[0]}%`)
-                .limit(60),
-              status?.status === 'CONNECTED' ? api.liveSearch(keywords) : Promise.resolve({ products: [] }),
+            let dbQuery = supabase
+              .from('products')
+              .select('id,channel_id,channel_name,product_name,raw_text,price,status,telegram_link,image_path,posted_at');
+            for (const t of terms) {
+              dbQuery = dbQuery.ilike('search_text', `%${t}%`);
+            }
+            const [dbExactModel, liveExactModel] = await Promise.all([
+              dbQuery.limit(40),
+              status?.status === 'CONNECTED' ? api.liveSearch(terms.join(' ')) : Promise.resolve({ products: [] }),
             ]);
-            for (const item of [...(dbMore.data || []), ...(liveRes.products || [])]) {
-              if (!mergedMap.has(item.id)) {
-                mergedMap.set(item.id, { ...item, distance: 26 });
+
+            for (const item of [...(dbExactModel.data || []), ...(liveExactModel.products || [])]) {
+              if (mergedMap.has(item.id)) continue;
+              const titleLow = (item.product_name || '').toLowerCase();
+              // Must match ALL core model words in the product title itself so zero unrelated products enter
+              if (terms.every((t) => titleLow.includes(t))) {
+                mergedMap.set(item.id, { ...item, distance: 14 });
               }
             }
             combined = Array.from(mergedMap.values()).sort(
@@ -223,7 +244,7 @@ export default function Dashboard({ session }) {
       }
 
       setPhoto({ preview, rows: combined, loading: false });
-      if (!combined.length) toast('Aa photo jevu koi product malyu nahi.');
+      if (!combined.length) toast('Aa product no photo malyo nahi.');
     } catch (err) {
       setPhoto(null);
       toast(err.message || 'Photo search na thayu.', true);
@@ -306,8 +327,8 @@ export default function Dashboard({ session }) {
                 <img src={photo.preview} alt="" />
                 <span style={{ flex: 1 }}>
                   {photo.loading
-                    ? 'Photo match & all color variants searching…'
-                    : `${photoItems.length} product${photoItems.length === 1 ? '' : 's'} (Same color first, White/Blue/other colors after)`}
+                    ? 'Same product & color variants searching…'
+                    : `${photoItems.length} same product${photoItems.length === 1 ? '' : 's'} (Same color first, other colors after)`}
                 </span>
                 <button className="btn sm" onClick={clearPhoto}><X size={14} />Clear</button>
               </div>
@@ -324,7 +345,7 @@ export default function Dashboard({ session }) {
               <div className="push">
                 <label htmlFor="sort" className="muted hide-sm">Sort by</label>
                 <select id="sort" className="select" value={photo ? photoSort : sort} onChange={(e) => (photo ? setPhotoSort(e.target.value) : setSort(e.target.value))}>
-                  {photo && <option value="match">Photo Match (Exact → All Colors)</option>}
+                  {photo && <option value="match">Same Product (Exact → Other Colors)</option>}
                   <option value="new">Latest to Old</option>
                   <option value="price_asc">Price: Low to High</option>
                   <option value="price_desc">Price: High to Low</option>
@@ -386,7 +407,7 @@ export default function Dashboard({ session }) {
             <div className="grid">
               {items.map((p) => (
                 <ProductCard key={p.id} p={p} imageUrl={p.live_image || urlFor(p.image_path)} best={p.id === bestId}
-                  similarity={photo && p.distance != null ? Math.max(50, Math.round((1 - p.distance / 64) * 100)) : null} />
+                  similarity={photo && p.distance != null ? Math.max(75, Math.round((1 - p.distance / 64) * 100)) : null} />
               ))}
             </div>
             {!photo && <div ref={sentinel} className="sentinel" />}
